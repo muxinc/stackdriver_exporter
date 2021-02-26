@@ -14,6 +14,7 @@
 package collectors
 
 import (
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -72,8 +73,11 @@ type HistogramMetric struct {
 	keysHash uint64
 }
 
-func (t *TimeSeriesMetrics) CollectNewConstHistogram(timeSeries *monitoring.TimeSeries, reportTime time.Time, labelKeys []string, dist *monitoring.Distribution, buckets map[float64]uint64, labelValues []string) {
+func (t *TimeSeriesMetrics) CollectNewConstHistogram(timeSeries *monitoring.TimeSeries, reportTime time.Time, labelKeys []string, dist *monitoring.Distribution, buckets map[float64]uint64, labelValues []string, align string) {
 	fqName := buildFQName(timeSeries)
+	if align != "ALIGN_NONE" {
+		fqName += ":" + strings.TrimLeft(strings.ToLower(align), "align_")
+	}
 
 	if t.fillMissingLabels {
 		vs, ok := t.histogramMetrics[fqName]
@@ -109,8 +113,11 @@ func (t *TimeSeriesMetrics) newConstHistogram(fqName string, reportTime time.Tim
 	)
 }
 
-func (t *TimeSeriesMetrics) CollectNewConstMetric(timeSeries *monitoring.TimeSeries, reportTime time.Time, labelKeys []string, metricValueType prometheus.ValueType, metricValue float64, labelValues []string) {
+func (t *TimeSeriesMetrics) CollectNewConstMetric(timeSeries *monitoring.TimeSeries, reportTime time.Time, labelKeys []string, metricValueType prometheus.ValueType, metricValue float64, labelValues []string, align string) {
 	fqName := buildFQName(timeSeries)
+	if align != "ALIGN_NONE" {
+		fqName += ":" + strings.TrimLeft(strings.ToLower(align), "align_")
+	}
 
 	if t.fillMissingLabels {
 		vs, ok := t.constMetrics[fqName]

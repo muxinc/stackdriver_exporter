@@ -247,7 +247,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 				go func(metricDescriptor *monitoring.MetricDescriptor, ch chan<- prometheus.Metric) {
 					defer wg.Done()
 
-					level.Debug(c.logger).Log("msg", "retrieving Google Stackdriver Monitoring metrics for descriptor", "descriptor", metricDescriptor.Type, "aggregation", strings.ToUpper(align))
+					level.Debug(c.logger).Log("msg", "retrieving Google Stackdriver Monitoring metrics for descriptor", "descriptor", metricDescriptor.Type, "aggregation", align)
 
 					filter := fmt.Sprintf("metric.type=\"%s\"", metricDescriptor.Type)
 					if c.monitoringDropDelegatedProjects {
@@ -273,7 +273,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 							Filter(filter).
 							IntervalStartTime(startTime.Format(time.RFC3339Nano)).
 							IntervalEndTime(endTime.Format(time.RFC3339Nano)).
-							AggregationPerSeriesAligner(strings.ToUpper(align)).
+							AggregationPerSeriesAligner(align).
 							AggregationAlignmentPeriod("60s")
 					} else {
 						timeSeriesListCall = c.monitoringService.Projects.TimeSeries.List(utils.ProjectResource(c.projectID)).
@@ -293,7 +293,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 						if page == nil {
 							break
 						}
-						if err := c.reportTimeSeriesMetrics(page, metricDescriptor, ch); err != nil {
+						if err := c.reportTimeSeriesMetrics(page, metricDescriptor, align+"1m", ch); err != nil {
 							level.Error(c.logger).Log("msg", "error reporting Time Series metrics for descripto", "descriptor", metricDescriptor.Type, "err", err)
 							errChannel <- err
 							break
@@ -344,7 +344,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 			}
 			if err := c.monitoringService.Projects.MetricDescriptors.List(utils.ProjectResource(c.projectID)).
 				Filter(filter).
-				Pages(ctx, metricDescriptorsFunction(align)); err != nil {
+				Pages(ctx, metricDescriptorsFunction(strings.ToUpper(align))); err != nil {
 				errChannel <- err
 			}
 		}(metricsTypePrefix)
@@ -359,6 +359,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 func (c *MonitoringCollector) reportTimeSeriesMetrics(
 	page *monitoring.ListTimeSeriesResponse,
 	metricDescriptor *monitoring.MetricDescriptor,
+	align string,
 	ch chan<- prometheus.Metric,
 ) error {
 	var metricValue float64
@@ -441,7 +442,7 @@ func (c *MonitoringCollector) reportTimeSeriesMetrics(
 			dist := newestTSPoint.Value.DistributionValue
 			buckets, err := c.generateHistogramBuckets(dist)
 			if err == nil {
-				timeSeriesMetrics.CollectNewConstHistogram(timeSeries, newestEndTime, labelKeys, dist, buckets, labelValues)
+				timeSeriesMetrics.CollectNewConstHistogram(timeSeries, newestEndTime, labelKeys, dist, buckets, labelValues, align)
 			} else {
 				level.Debug(c.logger).Log("msg", "discarding", "resource", timeSeries.Resource.Type, "metric", timeSeries.Metric.Type, "err", err)
 			}
@@ -451,7 +452,7 @@ func (c *MonitoringCollector) reportTimeSeriesMetrics(
 			continue
 		}
 
-		timeSeriesMetrics.CollectNewConstMetric(timeSeries, newestEndTime, labelKeys, metricValueType, metricValue, labelValues)
+		timeSeriesMetrics.CollectNewConstMetric(timeSeries, newestEndTime, labelKeys, metricValueType, metricValue, labelValues, align)
 	}
 	timeSeriesMetrics.Complete()
 	return nil
