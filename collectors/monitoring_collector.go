@@ -36,6 +36,10 @@ var (
 		"monitoring.metrics-type-prefixes", "Comma separated Google Stackdriver Monitoring Metric Type prefixes ($STACKDRIVER_EXPORTER_MONITORING_METRICS_TYPE_PREFIXES).",
 	).Envar("STACKDRIVER_EXPORTER_MONITORING_METRICS_TYPE_PREFIXES").Required().String()
 
+	monitoringMetricsUserLabelMatches = kingpin.Flag(
+		"monitoring.metrics-user-label-matches", "Comma separated Google Stackdriver Monitoring Metric User Label matches ($STACKDRIVER_EXPORTER_MONITORING_METRICS_USER_LABEL_MATCHES).",
+	).Envar("STACKDRIVER_EXPORTER_MONITORING_METRICS_USER_LABEL_MATCHES").String()
+
 	monitoringMetricsInterval = kingpin.Flag(
 		"monitoring.metrics-interval", "Interval to request the Google Stackdriver Monitoring Metrics for. Only the most recent data point is used ($STACKDRIVER_EXPORTER_MONITORING_METRICS_INTERVAL).",
 	).Envar("STACKDRIVER_EXPORTER_MONITORING_METRICS_INTERVAL").Default("5m").Duration()
@@ -56,6 +60,7 @@ var (
 type MonitoringCollector struct {
 	projectID                       string
 	metricsTypePrefixes             []string
+	userLabelMatches                map[string]string
 	metricsInterval                 time.Duration
 	metricsOffset                   time.Duration
 	monitoringService               *monitoring.Service
@@ -146,9 +151,19 @@ func NewMonitoringCollector(projectID string, monitoringService *monitoring.Serv
 		}
 	}
 
+	userLabelMatches := map[string]string{}
+	for _, kv := range strings.Split(*monitoringMetricsUserLabelMatches, ",") {
+		ss := strings.Split(kv, "=")
+		if len(ss) != 2 {
+			return nil, fmt.Errorf("invalid user label filter match (want: k=v): %s", kv)
+		}
+		userLabelMatches[ss[0]] = ss[1]
+	}
+
 	monitoringCollector := &MonitoringCollector{
 		projectID:                       projectID,
 		metricsTypePrefixes:             filteredPrefixes,
+		userLabelMatches:                userLabelMatches,
 		metricsInterval:                 *monitoringMetricsInterval,
 		metricsOffset:                   *monitoringMetricsOffset,
 		monitoringService:               monitoringService,
@@ -202,75 +217,100 @@ func (c *MonitoringCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metric) error {
-	metricDescriptorsFunction := func(page *monitoring.ListMetricDescriptorsResponse) error {
-		var wg = &sync.WaitGroup{}
+	metricDescriptorsFunction := func(align string) func(page *monitoring.ListMetricDescriptorsResponse) error {
+		return func(page *monitoring.ListMetricDescriptorsResponse) error {
+			var wg = &sync.WaitGroup{}
 
-		c.apiCallsTotalMetric.Inc()
+			c.apiCallsTotalMetric.Inc()
 
-		// It has been noticed that the same metric descriptor can be obtained from different GCP
-		// projects. When that happens, metrics are fetched twice and it provokes the error:
-		//     "collected metric xxx was collected before with the same name and label values"
-		//
-		// Metric descriptor project is irrelevant when it comes to fetch metrics, as they will be
-		// fetched from all the delegated projects filtering by metric type. Considering that, we
-		// can filter descriptors to keep just one per type.
-		//
-		// The following makes sure metric descriptors are unique to avoid fetching more than once
-		uniqueDescriptors := make(map[string]*monitoring.MetricDescriptor)
-		for _, descriptor := range page.MetricDescriptors {
-			uniqueDescriptors[descriptor.Type] = descriptor
+			// It has been noticed that the same metric descriptor can be obtained from different GCP
+			// projects. When that happens, metrics are fetched twice and it provokes the error:
+			//     "collected metric xxx was collected before with the same name and label values"
+			//
+			// Metric descriptor project is irrelevant when it comes to fetch metrics, as they will be
+			// fetched from all the delegated projects filtering by metric type. Considering that, we
+			// can filter descriptors to keep just one per type.
+			//
+			// The following makes sure metric descriptors are unique to avoid fetching more than once
+			uniqueDescriptors := make(map[string]*monitoring.MetricDescriptor)
+			for _, descriptor := range page.MetricDescriptors {
+				uniqueDescriptors[descriptor.Type] = descriptor
+			}
+
+			errChannel := make(chan error, len(uniqueDescriptors))
+
+			endTime := time.Now().UTC().Add(c.metricsOffset * -1)
+			startTime := endTime.Add(c.metricsInterval * -1)
+
+			for _, metricDescriptor := range uniqueDescriptors {
+				wg.Add(1)
+				go func(metricDescriptor *monitoring.MetricDescriptor, ch chan<- prometheus.Metric) {
+					defer wg.Done()
+
+					level.Debug(c.logger).Log("msg", "retrieving Google Stackdriver Monitoring metrics for descriptor", "descriptor", metricDescriptor.Type, "aggregation", strings.ToUpper(align))
+
+					filter := fmt.Sprintf("metric.type=\"%s\"", metricDescriptor.Type)
+					if c.monitoringDropDelegatedProjects {
+						filter = fmt.Sprintf(
+							"project=\"%s\" AND metric.type=\"%s\"",
+							c.projectID,
+							metricDescriptor.Type)
+					}
+
+					var timeSeriesListCall *monitoring.ProjectsTimeSeriesListCall
+					if align != "ALIGN_NONE" {
+						var ulFilter []string
+						for k, v := range c.userLabelMatches {
+							ulFilter = append(ulFilter, fmt.Sprintf("metadata.user_labels.%s = \"%s\"", k, v))
+						}
+						if len(ulFilter) > 0 {
+							// According to Google docs (https://cloud.google.com/monitoring/api/v3/filters#comparisons)
+							// OR has higher precedence than AND (wat).
+							filter += " AND " + strings.Join(ulFilter, " OR ")
+						}
+
+						timeSeriesListCall = c.monitoringService.Projects.TimeSeries.List(utils.ProjectResource(c.projectID)).
+							Filter(filter).
+							IntervalStartTime(startTime.Format(time.RFC3339Nano)).
+							IntervalEndTime(endTime.Format(time.RFC3339Nano)).
+							AggregationPerSeriesAligner(strings.ToUpper(align)).
+							AggregationAlignmentPeriod("60s")
+					} else {
+						timeSeriesListCall = c.monitoringService.Projects.TimeSeries.List(utils.ProjectResource(c.projectID)).
+							Filter(filter).
+							IntervalStartTime(startTime.Format(time.RFC3339Nano)).
+							IntervalEndTime(endTime.Format(time.RFC3339Nano))
+					}
+
+					for {
+						c.apiCallsTotalMetric.Inc()
+						page, err := timeSeriesListCall.Do()
+						if err != nil {
+							level.Error(c.logger).Log("msg", "error retrieving Time Series metrics for descriptor", "descriptor", metricDescriptor.Type, "err", err)
+							errChannel <- err
+							break
+						}
+						if page == nil {
+							break
+						}
+						if err := c.reportTimeSeriesMetrics(page, metricDescriptor, ch); err != nil {
+							level.Error(c.logger).Log("msg", "error reporting Time Series metrics for descripto", "descriptor", metricDescriptor.Type, "err", err)
+							errChannel <- err
+							break
+						}
+						if page.NextPageToken == "" {
+							break
+						}
+						timeSeriesListCall.PageToken(page.NextPageToken)
+					}
+				}(metricDescriptor, ch)
+			}
+
+			wg.Wait()
+			close(errChannel)
+
+			return <-errChannel
 		}
-
-		errChannel := make(chan error, len(uniqueDescriptors))
-
-		endTime := time.Now().UTC().Add(c.metricsOffset * -1)
-		startTime := endTime.Add(c.metricsInterval * -1)
-
-		for _, metricDescriptor := range uniqueDescriptors {
-			wg.Add(1)
-			go func(metricDescriptor *monitoring.MetricDescriptor, ch chan<- prometheus.Metric) {
-				defer wg.Done()
-				level.Debug(c.logger).Log("msg", "retrieving Google Stackdriver Monitoring metrics for descriptor", "descriptor", metricDescriptor.Type)
-				filter := fmt.Sprintf("metric.type=\"%s\"", metricDescriptor.Type)
-				if c.monitoringDropDelegatedProjects {
-					filter = fmt.Sprintf(
-						"project=\"%s\" AND metric.type=\"%s\"",
-						c.projectID,
-						metricDescriptor.Type)
-				}
-				timeSeriesListCall := c.monitoringService.Projects.TimeSeries.List(utils.ProjectResource(c.projectID)).
-					Filter(filter).
-					IntervalStartTime(startTime.Format(time.RFC3339Nano)).
-					IntervalEndTime(endTime.Format(time.RFC3339Nano))
-
-				for {
-					c.apiCallsTotalMetric.Inc()
-					page, err := timeSeriesListCall.Do()
-					if err != nil {
-						level.Error(c.logger).Log("msg", "error retrieving Time Series metrics for descriptor", "descriptor", metricDescriptor.Type, "err", err)
-						errChannel <- err
-						break
-					}
-					if page == nil {
-						break
-					}
-					if err := c.reportTimeSeriesMetrics(page, metricDescriptor, ch); err != nil {
-						level.Error(c.logger).Log("msg", "error reporting Time Series metrics for descripto", "descriptor", metricDescriptor.Type, "err", err)
-						errChannel <- err
-						break
-					}
-					if page.NextPageToken == "" {
-						break
-					}
-					timeSeriesListCall.PageToken(page.NextPageToken)
-				}
-			}(metricDescriptor, ch)
-		}
-
-		wg.Wait()
-		close(errChannel)
-
-		return <-errChannel
 	}
 
 	var wg = &sync.WaitGroup{}
@@ -281,8 +321,20 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 		wg.Add(1)
 		go func(metricsTypePrefix string) {
 			defer wg.Done()
-			level.Debug(c.logger).Log("msg", "listing Google Stackdriver Monitoring metric descriptors starting with", "prefix", metricsTypePrefix)
+
 			ctx := context.Background()
+
+			align := "ALIGN_NONE"
+			ss := strings.SplitN(metricsTypePrefix, ":", 2)
+			if len(ss) == 2 {
+				align, metricsTypePrefix = ss[0], ss[1]
+			} else if len(ss) > 2 {
+				errChannel <- fmt.Errorf("invalid metric prefix fromat: %s (want '[align:]prefix')", ss)
+				return
+			}
+
+			level.Debug(c.logger).Log("msg", "listing Google Stackdriver Monitoring metric descriptors starting with", "prefix", metricsTypePrefix)
+
 			filter := fmt.Sprintf("metric.type = starts_with(\"%s\")", metricsTypePrefix)
 			if c.monitoringDropDelegatedProjects {
 				filter = fmt.Sprintf(
@@ -292,7 +344,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 			}
 			if err := c.monitoringService.Projects.MetricDescriptors.List(utils.ProjectResource(c.projectID)).
 				Filter(filter).
-				Pages(ctx, metricDescriptorsFunction); err != nil {
+				Pages(ctx, metricDescriptorsFunction(align)); err != nil {
 				errChannel <- err
 			}
 		}(metricsTypePrefix)
